@@ -86,6 +86,19 @@ export interface PositionItem {
   open_time?: string; // legacy ISO string
   closed_at?: number;
   dry_run?: boolean;
+  managed_by?: string;
+  opened_by?: string;
+  source?: string;
+  bot_strategy?: string;
+  paper_margin_usd?: number;
+  paper_open_fee_usd?: number;
+  paper_close_fee_est_usd?: number;
+  paper_round_trip_fee_est_usd?: number;
+  paper_fee_pct?: number;
+  paper_long_rate_pct?: number;
+  paper_short_rate_pct?: number;
+  paper_long_interval_h?: number;
+  paper_short_interval_h?: number;
   strategy?: string;
   quote?: string;
   long_symbol?: string;
@@ -183,6 +196,129 @@ export interface StrategyParams {
   min_edge_mismatch?: number;
   fee_mode?: "auto" | "api" | "vip_tier";
   venue_fee_tiers?: Record<string, string>;
+}
+
+export interface PaperBotConfig {
+  enabled: boolean;
+  initialBalanceUsdt: number;
+  depthMultiple: number;
+  consecutiveHits: number;
+  minSettleMinutes: number;
+  maxSettleMinutes: number;
+  maxHoldHours: number;
+  maxActionsPerRun: number;
+}
+
+export interface PaperBotAction {
+  action: string;
+  position_id?: string;
+  base?: string;
+  reason?: string;
+  edge?: number;
+  hold_hours?: number;
+  candidate_key?: string;
+  candidate?: OpportunityItem & Record<string, any>;
+  result?: Record<string, any>;
+}
+
+export interface PaperBotSkipped {
+  key: string;
+  base?: string;
+  direction?: string;
+  long_venue?: string;
+  short_venue?: string;
+  reason: string;
+}
+
+export interface PaperBotSummary {
+  ts: string;
+  strategy: string;
+  dry_run: boolean;
+  enabled: boolean;
+  venues: string[];
+  scan_total: number;
+  candidates_after_filter: number;
+  ready_candidates: number;
+  actions: PaperBotAction[];
+  open_positions: number;
+  hit_counts: Record<string, number>;
+  skipped: PaperBotSkipped[];
+  thresholds: Record<string, any>;
+  account?: PaperBotAccount;
+}
+
+export interface PaperBotAccount {
+  currency: string;
+  initial_balance_usdt: number;
+  equity_usdt: number;
+  available_balance_usdt: number;
+  reserved_margin_usdt: number;
+  gross_pnl_usdt: number;
+  net_pnl_usdt: number;
+  realized_pnl_usdt: number;
+  unrealized_pnl_usdt: number;
+  price_pnl_usdt: number;
+  funding_pnl_usdt: number;
+  fees_paid_usdt: number;
+  open_fee_paid_usdt: number;
+  close_fee_paid_usdt: number;
+  total_trade_usdt: number;
+  open_positions: number;
+  closed_trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  ledger_entries: number;
+  updated_at: string;
+}
+
+export interface PaperBotLedgerEntry {
+  id: string;
+  ts: string;
+  type: "open" | "close" | string;
+  position_id: string;
+  base: string;
+  direction: string;
+  long_venue: string;
+  short_venue: string;
+  trade_usd: number;
+  gross_notional_usd?: number;
+  qty?: number;
+  fee_usd?: number;
+  open_fee_usd?: number;
+  close_fee_usd?: number;
+  total_fee_usd?: number;
+  margin_usd?: number;
+  margin_released_usd?: number;
+  price_pnl_usd?: number;
+  funding_pnl_usd?: number;
+  gross_pnl_usd?: number;
+  net_pnl_usd?: number;
+  long_settlements?: number;
+  short_settlements?: number;
+  real_edge_pct?: number;
+  net_edge_pct?: number;
+  edge_pct?: number | null;
+  reason?: string;
+}
+
+export interface PaperBotStatus {
+  running: boolean;
+  last_run_at: string | null;
+  last_finished_at: string | null;
+  last_error: string | null;
+  last_summary: PaperBotSummary | null;
+  hit_counts: Record<string, number>;
+  total_runs: number;
+  next_run_at: string | null;
+  auto_started_at: string | null;
+  auto_stopped_at: string | null;
+  auto_running: boolean;
+  available: boolean;
+  import_error: string | null;
+  config: PaperBotConfig;
+  locked: boolean;
+  config_updated_at?: string;
 }
 
 export interface FeeTierOption {
@@ -345,6 +481,34 @@ export function getFeeTiers() {
 
 export function getResolvedFees() {
   return useApi<ResolvedFees>("/settings/fees");
+}
+
+export function getPaperBotConfig() {
+  return useApi<PaperBotConfig>("/paper-bot/config");
+}
+
+export function getPaperBotStatus() {
+  return useApi<PaperBotStatus>("/paper-bot/status");
+}
+
+export function getPaperBotAccount() {
+  return useApi<PaperBotAccount>("/paper-bot/account");
+}
+
+export function getPaperBotJournal(limit = 50) {
+  return useApi<PaperBotSummary[]>(`/paper-bot/journal?limit=${limit}`);
+}
+
+export function getPaperBotLedger(limit = 100) {
+  return useApi<PaperBotLedgerEntry[]>(`/paper-bot/ledger?limit=${limit}`);
+}
+
+export function startPaperBot() {
+  return post<PaperBotStatus>("/paper-bot/start", {});
+}
+
+export function stopPaperBot() {
+  return post<PaperBotStatus>("/paper-bot/stop", {});
 }
 
 // ─── Cash-and-Carry types ──────────────────────────────────────────

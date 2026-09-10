@@ -24,6 +24,7 @@ import {
   StatsChartOutline,
   DocumentTextOutline,
   PulseOutline,
+  HardwareChipOutline,
   KeyOutline,
   WalletOutline,
   ToggleOutline,
@@ -59,6 +60,11 @@ const menuOptions = computed<MenuOption[]>(() => [
     label: t('menu.backtest'),
     key: '/backtest',
     icon: () => h(NIcon, null, { default: () => h(StatsChartOutline) }),
+  },
+  {
+    label: t('menu.paperBot'),
+    key: '/paper-bot',
+    icon: () => h(NIcon, null, { default: () => h(HardwareChipOutline) }),
   },
   {
     label: t('menu.cex'),

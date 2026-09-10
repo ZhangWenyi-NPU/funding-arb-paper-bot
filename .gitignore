@@ -12,6 +12,7 @@ strategy-runs/
 # Frontend
 web/node_modules/
 web/dist/
+.pnpm-store/
 
 # Python
 __pycache__/

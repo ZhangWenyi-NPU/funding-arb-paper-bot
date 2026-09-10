@@ -26,7 +26,7 @@ for _p in (str(_ROOT_DIR), str(_SCRIPTS_DIR)):
 # ---------------------------------------------------------------------------
 # Routers
 # ---------------------------------------------------------------------------
-from server.routes import backtest, positions, scanner, settings  # noqa: E402
+from server.routes import backtest, paper_bot, positions, scanner, settings  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # WebSocket connection manager
@@ -149,6 +149,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[credentials] ensure_env failed: {e}")
     task = asyncio.create_task(_background_scanner_loop())
+    await paper_bot.start_paper_bot_if_enabled()
 
     def _log_task_crash(t: asyncio.Task) -> None:
         if not t.cancelled() and t.exception() is not None:
@@ -163,6 +164,7 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+        await paper_bot.shutdown_paper_bot_auto()
         print("[funding-arb server] shutting down")
 
 
@@ -188,6 +190,7 @@ app.include_router(scanner.router, prefix="/api")
 app.include_router(positions.router, prefix="/api")
 app.include_router(backtest.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
+app.include_router(paper_bot.router, prefix="/api")
 
 
 # ---------------------------------------------------------------------------

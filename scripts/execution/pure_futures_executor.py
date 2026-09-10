@@ -99,6 +99,42 @@ def _record_position(record: dict[str, Any], path: Path = POSITIONS_PATH) -> Non
         lock_fd.close()
 
 
+_POSITION_META_RESERVED = {
+    "id",
+    "status",
+    "strategy",
+    "dry_run",
+    "base",
+    "direction",
+    "quote",
+    "long_venue",
+    "short_venue",
+    "qty",
+    "long_qty",
+    "short_qty",
+    "long_price",
+    "short_price",
+    "trade_usd",
+    "mark_spread_pct",
+    "opened_at",
+    "parallel_legs",
+}
+
+
+def _with_position_metadata(
+    record: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not metadata:
+        return record
+    out = dict(record)
+    for key, value in metadata.items():
+        if key in _POSITION_META_RESERVED:
+            continue
+        out[key] = value
+    return out
+
+
 def _mark_closed(
     position_id: str, close_info: dict[str, Any], path: Path = POSITIONS_PATH
 ) -> bool:
@@ -267,6 +303,7 @@ def open_pure_futures_pair(
     short_venue: Any = None,
     positions_path: Path = POSITIONS_PATH,
     capital_buffer_pct: float = 0.0,
+    metadata: dict[str, Any] | None = None,
 ) -> CrossVenueResult:
     """Open a pure futures funding-spread pair: long perp on one venue, short perp on another.
 
@@ -334,23 +371,26 @@ def open_pure_futures_pair(
         executed.extend(lv.execute_trades([long_trade], long_market, dry_run=True))
         executed.extend(sv.execute_trades([short_trade], short_market, dry_run=True))
         _record_position(
-            {
-                "id": position_id,
-                "status": "open",
-                "strategy": "pure_futures_spread",
-                "dry_run": True,
-                "base": base,
-                "direction": direction,
-                "quote": quote,
-                "long_venue": long_venue_id,
-                "short_venue": short_venue_id,
-                "qty": base_amount,
-                "long_price": long_px,
-                "short_price": short_px,
-                "trade_usd": trade_usd,
-                "mark_spread_pct": round(mark_spread_pct, 6),
-                "opened_at": int(time.time() * 1000),
-            },
+            _with_position_metadata(
+                {
+                    "id": position_id,
+                    "status": "open",
+                    "strategy": "pure_futures_spread",
+                    "dry_run": True,
+                    "base": base,
+                    "direction": direction,
+                    "quote": quote,
+                    "long_venue": long_venue_id,
+                    "short_venue": short_venue_id,
+                    "qty": base_amount,
+                    "long_price": long_px,
+                    "short_price": short_px,
+                    "trade_usd": trade_usd,
+                    "mark_spread_pct": round(mark_spread_pct, 6),
+                    "opened_at": int(time.time() * 1000),
+                },
+                metadata,
+            ),
             positions_path,
         )
         logs.append(
@@ -434,26 +474,29 @@ def open_pure_futures_pair(
             short_qty = _exec_qty(res_short, target_qty)
             logs.append(f"Parallel both legs filled: long={exec_qty} short={short_qty} {base}")
             _record_position(
-                {
-                    "id": position_id,
-                    "status": "open",
-                    "strategy": "pure_futures_spread",
-                    "dry_run": False,
-                    "base": base,
-                    "direction": direction,
-                    "quote": quote,
-                    "long_venue": long_venue_id,
-                    "short_venue": short_venue_id,
-                    "qty": min(exec_qty, short_qty),
-                    "long_qty": exec_qty,
-                    "short_qty": short_qty,
-                    "long_price": res_long[0].get("exec_price", long_px),
-                    "short_price": res_short[0].get("exec_price", short_px),
-                    "trade_usd": trade_usd,
-                    "mark_spread_pct": round(mark_spread_pct, 6),
-                    "opened_at": int(time.time() * 1000),
-                    "parallel_legs": True,
-                },
+                _with_position_metadata(
+                    {
+                        "id": position_id,
+                        "status": "open",
+                        "strategy": "pure_futures_spread",
+                        "dry_run": False,
+                        "base": base,
+                        "direction": direction,
+                        "quote": quote,
+                        "long_venue": long_venue_id,
+                        "short_venue": short_venue_id,
+                        "qty": min(exec_qty, short_qty),
+                        "long_qty": exec_qty,
+                        "short_qty": short_qty,
+                        "long_price": res_long[0].get("exec_price", long_px),
+                        "short_price": res_short[0].get("exec_price", short_px),
+                        "trade_usd": trade_usd,
+                        "mark_spread_pct": round(mark_spread_pct, 6),
+                        "opened_at": int(time.time() * 1000),
+                        "parallel_legs": True,
+                    },
+                    metadata,
+                ),
                 positions_path,
             )
             return CrossVenueResult(True, "filled", position_id, executed, logs)
@@ -524,25 +567,28 @@ def open_pure_futures_pair(
         short_qty = _exec_qty(res_short, exec_qty)
         logs.append(f"Short leg filled {short_venue_id} open_short {short_qty} {base}")
         _record_position(
-            {
-                "id": position_id,
-                "status": "open",
-                "strategy": "pure_futures_spread",
-                "dry_run": False,
-                "base": base,
-                "direction": direction,
-                "quote": quote,
-                "long_venue": long_venue_id,
-                "short_venue": short_venue_id,
-                "qty": min(exec_qty, short_qty),
-                "long_qty": exec_qty,
-                "short_qty": short_qty,
-                "long_price": res_long[0].get("exec_price", long_px),
-                "short_price": res_short[0].get("exec_price", short_px),
-                "trade_usd": trade_usd,
-                "mark_spread_pct": round(mark_spread_pct, 6),
-                "opened_at": int(time.time() * 1000),
-            },
+            _with_position_metadata(
+                {
+                    "id": position_id,
+                    "status": "open",
+                    "strategy": "pure_futures_spread",
+                    "dry_run": False,
+                    "base": base,
+                    "direction": direction,
+                    "quote": quote,
+                    "long_venue": long_venue_id,
+                    "short_venue": short_venue_id,
+                    "qty": min(exec_qty, short_qty),
+                    "long_qty": exec_qty,
+                    "short_qty": short_qty,
+                    "long_price": res_long[0].get("exec_price", long_px),
+                    "short_price": res_short[0].get("exec_price", short_px),
+                    "trade_usd": trade_usd,
+                    "mark_spread_pct": round(mark_spread_pct, 6),
+                    "opened_at": int(time.time() * 1000),
+                },
+                metadata,
+            ),
             positions_path,
         )
         return CrossVenueResult(True, "filled", position_id, executed, logs)
@@ -650,6 +696,8 @@ def close_pure_futures_pair(
             position_id,
             {
                 "dry_run": True,
+                "short_price": short_px,
+                "long_price": long_px,
                 "open_mark_spread": open_mark_spread,
                 "close_mark_spread": close_mark_spread,
             },

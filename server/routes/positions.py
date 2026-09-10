@@ -398,6 +398,11 @@ async def open_position(req: OpenPositionRequest):
                     dry_run=req.dry_run,
                     max_mark_spread_pct=max_mark,
                     config=exec_config,
+                    metadata={
+                        "managed_by": "manual",
+                        "opened_by": "manual",
+                        "source": "positions_api",
+                    },
                 ),
             )
             return _format_open_result(result)
@@ -505,6 +510,27 @@ async def close_position(position_id: str, req: ClosePositionRequest | None = No
         if not ok:
             logs = getattr(result, "logs", None) or []
             resp["error"] = "; ".join(str(x) for x in logs[-3:]) or "close aborted"
+        elif target.get("dry_run") is True:
+            try:
+                from server.paper_account import (  # noqa: E402
+                    is_bot_managed_position,
+                    record_bot_close,
+                )
+
+                if is_bot_managed_position(target):
+                    refreshed = _read_positions()
+                    after = next((p for p in refreshed if p.get("id") == position_id), None)
+                    event = record_bot_close(
+                        target,
+                        after,
+                        reason=(req.reason if req else "") or "manual_close",
+                        edge=None,
+                        result=result,
+                    )
+                    if event is not None:
+                        resp["account_event"] = event
+            except Exception:
+                pass
         return resp
     except Exception as e:
         return {"success": False, "error": f"Failed to close position: {e}"}

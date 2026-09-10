@@ -23,6 +23,12 @@ const routes = [
     meta: { titleKey: "menu.backtest" },
   },
   {
+    path: "/paper-bot",
+    name: "PaperBot",
+    component: () => import("@/views/PaperBot.vue"),
+    meta: { titleKey: "menu.paperBot" },
+  },
+  {
     path: "/cex",
     name: "CexConnection",
     component: () => import("@/views/CexConnection.vue"),
