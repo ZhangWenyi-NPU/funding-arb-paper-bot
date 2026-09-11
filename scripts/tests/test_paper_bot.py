@@ -162,6 +162,83 @@ def test_run_once_skips_candidates_outside_settle_window(tmp_path, monkeypatch):
     assert "too far from settlement" in json.dumps(out["skipped"])
 
 
+def test_active_exit_holds_missing_candidate_until_funding_collected(tmp_path, monkeypatch):
+    _patch_storage(monkeypatch, tmp_path)
+    _patch_strategy(monkeypatch)
+    now_ms = int(time.time() * 1000)
+    paper_bot._save_config(
+        paper_bot.PaperBotConfig(
+            activeExitEnabled=True,
+            activeExitConfirmMinutes=0,
+            activeExitWindowMinutes=30,
+            maxHoldHours=9,
+        )
+    )
+    pos = {
+        "id": "pf-BTC-okx-bybit-test",
+        "status": "open",
+        "dry_run": True,
+        "managed_by": "paper_bot",
+        "base": "BTC",
+        "direction": "forward",
+        "long_venue": "okx",
+        "short_venue": "bybit",
+        "trade_usd": 1000,
+        "opened_at": now_ms - 20 * 60 * 1000,
+        "paper_long_next_settle_ms": now_ms + 20 * 60 * 1000,
+        "paper_short_next_settle_ms": now_ms + 20 * 60 * 1000,
+    }
+    monkeypatch.setattr(paper_bot, "scan_pure_futures_spreads", lambda **kwargs: {"forward": [], "reverse": []})
+    monkeypatch.setattr(paper_bot, "load_pure_futures_positions", lambda: [pos])
+
+    closed: list[str] = []
+    monkeypatch.setattr(
+        paper_bot,
+        "close_pure_futures_pair",
+        lambda position_id, **kwargs: closed.append(position_id) or FakeResult(),
+    )
+
+    out = paper_bot._run_once_sync()
+    assert closed == []
+    assert out["actions"] == []
+
+
+def test_active_exit_closes_missing_candidate_after_exit_window(tmp_path, monkeypatch):
+    _patch_storage(monkeypatch, tmp_path)
+    _patch_strategy(monkeypatch)
+    now_ms = int(time.time() * 1000)
+    paper_bot._save_config(
+        paper_bot.PaperBotConfig(
+            activeExitEnabled=True,
+            activeExitConfirmMinutes=0,
+            activeExitWindowMinutes=1,
+            maxHoldHours=9,
+        )
+    )
+    pos = {
+        "id": "pf-BTC-okx-bybit-test",
+        "status": "open",
+        "dry_run": True,
+        "managed_by": "paper_bot",
+        "base": "BTC",
+        "direction": "forward",
+        "long_venue": "okx",
+        "short_venue": "bybit",
+        "trade_usd": 1000,
+        "opened_at": now_ms - 60 * 60 * 1000,
+        "paper_long_next_settle_ms": now_ms - 5 * 60 * 1000,
+        "paper_short_next_settle_ms": now_ms - 5 * 60 * 1000,
+    }
+    monkeypatch.setattr(paper_bot, "scan_pure_futures_spreads", lambda **kwargs: {"forward": [], "reverse": []})
+    monkeypatch.setattr(paper_bot, "load_pure_futures_positions", lambda: [pos])
+
+    monkeypatch.setattr(paper_bot, "close_pure_futures_pair", lambda *args, **kwargs: FakeResult())
+
+    out = paper_bot._run_once_sync()
+    assert out["actions"][0]["action"] == "close"
+    assert out["actions"][0]["reason"] == "candidate_missing_after_active_window"
+
+
 def test_start_stop_auto_toggle_config(tmp_path, monkeypatch):
     _patch_storage(monkeypatch, tmp_path)
     monkeypatch.setattr(paper_bot, "_AUTO_TASK", None)

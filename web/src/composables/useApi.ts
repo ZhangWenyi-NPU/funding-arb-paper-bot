@@ -140,6 +140,12 @@ export interface BacktestSummary {
   win_rate: number;
   total_trades: number;
   avg_hold_days: number;
+  scan_count?: number;
+  avg_candidates_after_filter?: number;
+  avg_ready_candidates?: number;
+  open_actions?: number;
+  close_actions?: number;
+  final_equity?: number;
 }
 
 export interface BacktestTrade {
@@ -151,6 +157,10 @@ export interface BacktestTrade {
   close_time: string;
   hold_days: number;
   pnl_usd: number;
+  close_reason?: string;
+  amount_usd?: number;
+  funding_pct?: number;
+  fee_pct?: number;
 }
 
 export interface EquityPoint {
@@ -160,12 +170,46 @@ export interface EquityPoint {
   capital_free?: number;
 }
 
+export interface BacktestScanRun {
+  ts: string;
+  scan_total: number;
+  candidates_after_filter: number;
+  ready_candidates: number;
+  actions: PaperBotAction[];
+  open_positions: number;
+  filter_counts?: Record<string, number>;
+  capital_free?: number;
+  equity?: number;
+  synthetic_settle_windows?: number;
+  skipped?: PaperBotSkipped[];
+}
+
+export interface BacktestDailyLog {
+  date: string;
+  scan_runs: number;
+  pairs_scanned: number;
+  spread_ok: number;
+  net_edge_ok: number;
+  real_edge_ok: number;
+  mark_spread_ok: number;
+  settle_window_ok: number;
+  mismatch_ok: number;
+  final_candidates: number;
+  consecutive_ok: number;
+  open_actions: number;
+  close_actions: number;
+}
+
 export interface BacktestResult {
   id: string;
+  mode?: string;
   params: Record<string, any>;
   summary: BacktestSummary;
   trades: BacktestTrade[];
   equity_curve?: EquityPoint[];
+  scan_journal?: BacktestScanRun[];
+  daily_logs?: BacktestDailyLog[];
+  data_quality?: Record<string, any>;
   run_time: string;
   live: boolean;
 }
@@ -207,6 +251,10 @@ export interface PaperBotConfig {
   maxSettleMinutes: number;
   maxHoldHours: number;
   maxActionsPerRun: number;
+  activeExitEnabled: boolean;
+  activeExitConfirmMinutes: number;
+  activeExitWindowMinutes: number;
+  activeExitMaxMarkSpreadPct: number;
 }
 
 export interface PaperBotAction {

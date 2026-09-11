@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
+  NAlert,
   NButton,
   NCard,
   NDataTable,
@@ -13,8 +14,11 @@ import {
   NGi,
   NGrid,
   NIcon,
+  NInput,
   NInputNumber,
   NModal,
+  NRadioButton,
+  NRadioGroup,
   NSelect,
   NSpace,
   NSpin,
@@ -29,20 +33,28 @@ import {
   OpenOutline,
   PieChartOutline,
   PlayCircleOutline,
+  PulseOutline,
   RefreshOutline,
   SaveOutline,
   ShieldCheckmarkOutline,
+  StatsChartOutline,
   StopCircleOutline,
   TrendingDownOutline,
   TrendingUpOutline,
   WalletOutline,
 } from '@vicons/ionicons5'
+import { use as useECharts } from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GridComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+import VChart from 'vue-echarts'
 import {
   getPaperBotConfig,
   getPaperBotAccount,
   getPaperBotJournal,
   getPaperBotLedger,
   getPaperBotStatus,
+  getBacktestHistory,
   getPositions,
   getResolvedFees,
   getScannerOpportunities,
@@ -51,6 +63,10 @@ import {
   post,
   startPaperBot,
   stopPaperBot,
+  type BacktestDailyLog,
+  type BacktestResult,
+  type BacktestScanRun,
+  type BacktestTrade,
   type PaperBotAccount,
   type PaperBotLedgerEntry,
   type OpportunityItem,
@@ -60,6 +76,9 @@ import {
 } from '@/composables/useApi'
 import { useI18n } from 'vue-i18n'
 
+useECharts([LineChart, GridComponent, TooltipComponent, CanvasRenderer])
+
+type PageMode = 'trade' | 'backtest'
 type BotState = 'qualified' | 'waiting'
 type StatusFilter = 'open' | 'closed' | 'all'
 
@@ -83,6 +102,10 @@ interface BotRules {
   maxSettleMinutes: number
   maxHoldHours: number
   maxActionsPerRun: number
+  activeExitEnabled: boolean
+  activeExitConfirmMinutes: number
+  activeExitWindowMinutes: number
+  activeExitMaxMarkSpreadPct: number
 }
 
 interface JournalRow {
@@ -94,6 +117,12 @@ interface JournalRow {
   edge: number | null
   reason: string
   result: string
+}
+
+interface BacktestScanRow extends BacktestScanRun {
+  id: string
+  actionSummary: string
+  skippedSummary: string
 }
 
 const { t } = useI18n()
@@ -108,12 +137,18 @@ const botAccount = getPaperBotAccount()
 const botStatus = getPaperBotStatus()
 const botJournal = getPaperBotJournal(50)
 const botLedger = getPaperBotLedger(100)
+const backtestHistory = getBacktestHistory()
 
+const pageMode = ref<PageMode>('trade')
 const botEnabled = ref(false)
 const saving = ref(false)
 const runningOnce = ref(false)
 const autoBusy = ref(false)
 const statusFilter = ref<StatusFilter>('open')
+const backtestRunning = ref(false)
+const backtestResult = ref<BacktestResult | null>(null)
+const backtestError = ref('')
+const backtestSynced = ref(false)
 let pollTimer: number | null = null
 let polling = false
 
@@ -139,6 +174,37 @@ const botRules = reactive<BotRules>({
   maxSettleMinutes: 90,
   maxHoldHours: 9,
   maxActionsPerRun: 5,
+  activeExitEnabled: true,
+  activeExitConfirmMinutes: 2,
+  activeExitWindowMinutes: 60,
+  activeExitMaxMarkSpreadPct: 0.15,
+})
+
+const backtestForm = reactive({
+  historyBases: '',
+  historyBaseLimit: 80,
+  historyDays: 90,
+  historyVenues: [] as string[],
+  capital: 100000,
+  tradeUsd: 5000,
+  minSpread: 0.08,
+  minEdge: 0.01,
+  minEdge1h: 0,
+  minEdgeMismatch: 0,
+  exitEdge: 0.01,
+  maxMarkSpread: 1,
+  maxPositions: 3,
+  maxHoldingHours: 9,
+  consecutiveHits: 2,
+  minSettleMinutes: 10,
+  maxSettleMinutes: 90,
+  maxActionsPerRun: 5,
+  activeExitEnabled: true,
+  activeExitConfirmMinutes: 2,
+  activeExitWindowMinutes: 60,
+  activeExitMaxMarkSpreadPct: 0.15,
+  basisCostPct: 0.05,
+  allowMismatch: false,
 })
 
 const loading = computed(() =>
@@ -156,6 +222,16 @@ const scanVenueOptions = computed(() =>
 )
 
 const tradeUsd = computed(() => strategyForm.trade_usd || 5000)
+
+const hasBacktestResult = computed(() => backtestResult.value !== null)
+
+function isPaperBotBacktest(row: BacktestResult | null | undefined): boolean {
+  if (!row) return false
+  return row.mode === 'paper_bot' || row.id.startsWith('pbot-bt-')
+}
+
+const isPaperBotBacktestResult = computed(() => isPaperBotBacktest(backtestResult.value))
+const selectedBacktestIsLegacy = computed(() => hasBacktestResult.value && !isPaperBotBacktestResult.value)
 
 function hydrateStrategyForm() {
   const s = strategy.data.value
@@ -184,6 +260,40 @@ function hydrateBotRules() {
   botRules.maxSettleMinutes = cfg.maxSettleMinutes
   botRules.maxHoldHours = cfg.maxHoldHours
   botRules.maxActionsPerRun = cfg.maxActionsPerRun
+  botRules.activeExitEnabled = cfg.activeExitEnabled ?? true
+  botRules.activeExitConfirmMinutes = cfg.activeExitConfirmMinutes ?? 2
+  botRules.activeExitWindowMinutes = cfg.activeExitWindowMinutes ?? 60
+  botRules.activeExitMaxMarkSpreadPct = cfg.activeExitMaxMarkSpreadPct ?? 0.15
+}
+
+function syncBacktestFromBot(showSuccess = false) {
+  backtestForm.capital = botRules.initialBalanceUsdt || backtestForm.capital
+  backtestForm.tradeUsd = strategyForm.trade_usd || backtestForm.tradeUsd
+  backtestForm.minSpread = strategyForm.min_spread_annual || backtestForm.minSpread
+  backtestForm.minEdge = strategyForm.min_edge_annual || backtestForm.minEdge
+  backtestForm.minEdge1h = strategyForm.min_edge_1h || 0
+  backtestForm.minEdgeMismatch = strategyForm.min_edge_mismatch || 0
+  backtestForm.maxMarkSpread = strategyForm.max_mark_spread_pct || backtestForm.maxMarkSpread
+  backtestForm.maxPositions = strategyForm.max_positions || backtestForm.maxPositions
+  backtestForm.maxHoldingHours = botRules.maxHoldHours || backtestForm.maxHoldingHours
+  backtestForm.consecutiveHits = botRules.consecutiveHits || backtestForm.consecutiveHits
+  backtestForm.minSettleMinutes = botRules.minSettleMinutes
+  backtestForm.maxSettleMinutes = botRules.maxSettleMinutes
+  backtestForm.maxActionsPerRun = botRules.maxActionsPerRun || backtestForm.maxActionsPerRun
+  backtestForm.activeExitEnabled = botRules.activeExitEnabled
+  backtestForm.activeExitConfirmMinutes = botRules.activeExitConfirmMinutes
+  backtestForm.activeExitWindowMinutes = botRules.activeExitWindowMinutes
+  backtestForm.activeExitMaxMarkSpreadPct = botRules.activeExitMaxMarkSpreadPct
+  backtestForm.historyVenues = Array.isArray(strategyForm.scan_venues) ? [...strategyForm.scan_venues] : []
+  backtestForm.allowMismatch = (strategyForm.min_edge_mismatch ?? 0) > 0
+
+  const exitThreshold = botStatus.data.value?.last_summary?.thresholds?.exitThresholdPct
+  if (typeof exitThreshold === 'number') {
+    backtestForm.exitEdge = exitThreshold
+  }
+
+  backtestSynced.value = true
+  if (showSuccess) message.success(t('paperBot.backtestSynced'))
 }
 
 function botConfigPayload(enabled = botEnabled.value) {
@@ -196,6 +306,10 @@ function botConfigPayload(enabled = botEnabled.value) {
     maxSettleMinutes: botRules.maxSettleMinutes,
     maxHoldHours: botRules.maxHoldHours,
     maxActionsPerRun: botRules.maxActionsPerRun,
+    activeExitEnabled: botRules.activeExitEnabled,
+    activeExitConfirmMinutes: botRules.activeExitConfirmMinutes,
+    activeExitWindowMinutes: botRules.activeExitWindowMinutes,
+    activeExitMaxMarkSpreadPct: botRules.activeExitMaxMarkSpreadPct,
   }
 }
 
@@ -255,6 +369,20 @@ const allCandidates = computed<BotCandidate[]>(() => {
 
 const qualifiedCandidates = computed(() => allCandidates.value.filter((row) => row.state === 'qualified'))
 const waitingCandidates = computed(() => allCandidates.value.filter((row) => row.state === 'waiting'))
+
+function manualHistoryBases(): string {
+  return backtestForm.historyBases
+    .split(',')
+    .map((base) => base.trim().toUpperCase())
+    .filter(Boolean)
+    .join(',')
+}
+
+function backtestHistoryBasesPayload(): string | null {
+  const manual = manualHistoryBases()
+  if (manual) return manual
+  return null
+}
 
 function isBotManagedPosition(row: PositionItem): boolean {
   return row.managed_by === 'paper_bot' || row.opened_by === 'paper_bot' || row.source === 'paper_bot'
@@ -497,6 +625,86 @@ const summaryCards = computed(() => [
   },
 ])
 
+const backtestSummaryCards = computed(() => {
+  if (!backtestResult.value) return []
+  const s = backtestResult.value.summary
+  return [
+    {
+      label: t('backtest.totalPnl'),
+      value: fmtUsd(s.total_pnl_usd, true),
+      icon: s.total_pnl_usd >= 0 ? TrendingUpOutline : TrendingDownOutline,
+      color: s.total_pnl_usd >= 0 ? '#18a058' : '#d03050',
+    },
+    {
+      label: t('backtest.totalReturn'),
+      value: fmtPct(s.total_pnl_pct, 2),
+      icon: s.total_pnl_pct >= 0 ? TrendingUpOutline : TrendingDownOutline,
+      color: s.total_pnl_pct >= 0 ? '#18a058' : '#d03050',
+    },
+    {
+      label: t('backtest.annualized'),
+      value: fmtPct(s.annualized_pct, 2),
+      icon: PulseOutline,
+      color: '#f0a020',
+    },
+    {
+      label: t('backtest.sharpe'),
+      value: s.sharpe.toFixed(2),
+      icon: StatsChartOutline,
+      color: '#2080f0',
+    },
+    {
+      label: t('backtest.winRate'),
+      value: (s.win_rate * 100).toFixed(1) + '%',
+      icon: s.win_rate >= 0.5 ? TrendingUpOutline : TrendingDownOutline,
+      color: s.win_rate >= 0.5 ? '#18a058' : '#d03050',
+    },
+    {
+      label: t('backtest.maxDrawdown'),
+      value: fmtPct(s.max_drawdown_pct, 2),
+      icon: TrendingDownOutline,
+      color: '#d03050',
+    },
+  ]
+})
+
+const backtestChartOption = computed(() => {
+  const curve = backtestResult.value?.equity_curve ?? []
+  if (curve.length === 0) return null
+  return {
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params: Array<{ dataIndex: number }>) => {
+        const idx = params[0]?.dataIndex ?? 0
+        const pt = curve[idx]
+        if (!pt) return ''
+        return `${pt.ts}<br/>Equity: $${pt.equity.toLocaleString()}<br/>Open pairs: ${pt.open_pairs ?? 0}`
+      },
+    },
+    grid: { left: 48, right: 16, top: 24, bottom: 32 },
+    xAxis: {
+      type: 'category',
+      data: curve.map((p) => p.ts.slice(0, 10)),
+      axisLabel: { fontSize: 10 },
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      axisLabel: { formatter: (v: number) => `$${(v / 1000).toFixed(0)}k` },
+    },
+    series: [
+      {
+        type: 'line',
+        data: curve.map((p) => p.equity),
+        smooth: true,
+        showSymbol: false,
+        lineStyle: { width: 2, color: '#18a058' },
+        areaStyle: { color: 'rgba(24, 160, 88, 0.12)' },
+      },
+    ],
+  }
+})
+
 const isBotRunning = computed(() =>
   Boolean(runningOnce.value || botStatus.data.value?.running || botStatus.data.value?.locked),
 )
@@ -738,6 +946,150 @@ const ledgerColumns = computed<DataTableColumns<PaperBotLedgerEntry>>(() => [
     key: 'reason',
     ellipsis: { tooltip: true },
     render: (row) => row.reason || row.position_id || '-',
+  },
+])
+
+const backtestTradeColumns = computed<DataTableColumns<BacktestTrade>>(() => [
+  { title: t('backtest.pair'), key: 'base', width: 85, render: (row) => `${row.base}/USDT` },
+  { title: t('backtest.direction'), key: 'direction', width: 95 },
+  { title: t('backtest.longVenue'), key: 'long_venue', width: 120 },
+  { title: t('backtest.shortVenue'), key: 'short_venue', width: 120 },
+  { title: t('backtest.holdDays'), key: 'hold_days', width: 105, render: (row) => row.hold_days.toFixed(1) + 'd' },
+  {
+    title: t('paperBot.closeReason'),
+    key: 'close_reason',
+    width: 190,
+    ellipsis: { tooltip: true },
+    render: (row) => row.close_reason || '-',
+  },
+  {
+    title: t('backtest.pnlUsdt'),
+    key: 'pnl_usd',
+    width: 125,
+    render: (row) => h(
+      NText,
+      { type: row.pnl_usd >= 0 ? 'success' : 'error', strong: true },
+      { default: () => fmtUsd(row.pnl_usd, true) },
+    ),
+  },
+])
+
+const backtestHistoryColumns = computed<DataTableColumns<BacktestResult>>(() => [
+  {
+    title: t('paperBot.recordType'),
+    key: 'mode',
+    width: 110,
+    render: (row) => h(
+      NTag,
+      {
+        size: 'small',
+        type: isPaperBotBacktest(row) ? 'success' : 'default',
+        bordered: false,
+      },
+      { default: () => isPaperBotBacktest(row) ? t('paperBot.botBacktest') : t('paperBot.legacyBacktest') },
+    ),
+  },
+  { title: t('backtest.id'), key: 'id', width: 150 },
+  { title: t('backtest.runTime'), key: 'run_time', width: 170, render: (row) => formatTime(row.run_time) },
+  {
+    title: t('backtest.pnl'),
+    key: 'summary',
+    width: 120,
+    sorter: (a, b) => a.summary.total_pnl_usd - b.summary.total_pnl_usd,
+    render: (row) => h(
+      NText,
+      { type: row.summary.total_pnl_usd >= 0 ? 'success' : 'error', strong: true },
+      { default: () => fmtUsd(row.summary.total_pnl_usd, true) },
+    ),
+  },
+  { title: t('backtest.annualized'), key: 'annualized', width: 110, render: (row) => fmtPct(row.summary.annualized_pct, 2) },
+  { title: t('backtest.winRate'), key: 'win_rate', width: 95, render: (row) => (row.summary.win_rate * 100).toFixed(1) + '%' },
+  { title: t('backtest.trades'), key: 'trades', width: 85, render: (row) => row.summary.total_trades },
+])
+
+function scanActionSummary(actions: BacktestScanRun['actions'] = []): string {
+  if (!actions.length) return '-'
+  const opens = actions.filter((action) => action.action === 'open').length
+  const closes = actions.filter((action) => action.action === 'close').length
+  const parts: string[] = []
+  if (opens) parts.push(`${t('paperBot.openAction')} ${opens}`)
+  if (closes) parts.push(`${t('paperBot.closeAction')} ${closes}`)
+  return parts.length ? parts.join(' / ') : String(actions.length)
+}
+
+function skippedSummary(row: BacktestScanRun): string {
+  const skipped = row.skipped ?? []
+  if (!skipped.length) return '-'
+  const first = skipped.slice(0, 2).map((item) => item.reason).join(' / ')
+  return skipped.length > 2 ? `${first} +${skipped.length - 2}` : first
+}
+
+const backtestDailyRows = computed<BacktestDailyLog[]>(() =>
+  [...(backtestResult.value?.daily_logs ?? [])].reverse(),
+)
+
+const backtestDailyColumns = computed<DataTableColumns<BacktestDailyLog>>(() => [
+  { title: t('paperBot.date'), key: 'date', width: 110 },
+  { title: t('paperBot.scanRuns'), key: 'scan_runs', width: 95 },
+  { title: t('paperBot.pairsScanned'), key: 'pairs_scanned', width: 110 },
+  { title: t('paperBot.spreadOk'), key: 'spread_ok', width: 95 },
+  { title: t('paperBot.netEdgeOk'), key: 'net_edge_ok', width: 95 },
+  { title: t('paperBot.realEdgeOk'), key: 'real_edge_ok', width: 95 },
+  { title: t('paperBot.markSpreadOk'), key: 'mark_spread_ok', width: 95 },
+  { title: t('paperBot.settleWindowOk'), key: 'settle_window_ok', width: 110 },
+  { title: t('paperBot.finalCandidates'), key: 'final_candidates', width: 100 },
+  { title: t('paperBot.consecutiveOk'), key: 'consecutive_ok', width: 100 },
+  {
+    title: t('paperBot.openTrades'),
+    key: 'open_actions',
+    width: 95,
+    render: (row) => row.open_actions > 0
+      ? h(NTag, { size: 'small', type: 'success', bordered: false }, { default: () => row.open_actions })
+      : '0',
+  },
+])
+
+const backtestScanRows = computed<BacktestScanRow[]>(() =>
+  [...(backtestResult.value?.scan_journal ?? [])]
+    .reverse()
+    .slice(0, 250)
+    .map((row, idx) => ({
+      ...row,
+      id: `${row.ts}-${idx}`,
+      actionSummary: scanActionSummary(row.actions),
+      skippedSummary: skippedSummary(row),
+    })),
+)
+
+const backtestScanColumns = computed<DataTableColumns<BacktestScanRow>>(() => [
+  {
+    title: t('paperBot.time'),
+    key: 'ts',
+    width: 135,
+    render: (row) => formatTime(row.ts),
+  },
+  { title: t('paperBot.scanTotal'), key: 'scan_total', width: 90 },
+  { title: t('paperBot.filteredCandidates'), key: 'candidates_after_filter', width: 95 },
+  { title: t('paperBot.readyCandidates'), key: 'ready_candidates', width: 90 },
+  {
+    title: t('paperBot.latestActions'),
+    key: 'actionSummary',
+    width: 130,
+    render: (row) => row.actionSummary === '-'
+      ? '-'
+      : h(NTag, { size: 'small', type: row.actionSummary.includes(t('paperBot.openAction')) ? 'success' : 'warning', bordered: false }, { default: () => row.actionSummary }),
+  },
+  { title: t('positions.openPositions'), key: 'open_positions', width: 100 },
+  {
+    title: t('paperBot.accountEquity'),
+    key: 'equity',
+    width: 120,
+    render: (row) => fmtUsd(row.equity),
+  },
+  {
+    title: t('paperBot.reason'),
+    key: 'skippedSummary',
+    ellipsis: { tooltip: true },
   },
 ])
 
@@ -1071,6 +1423,21 @@ function showCloseConfirm(row: PositionItem) {
   showCloseModal.value = true
 }
 
+function loadBacktestResult(row: BacktestResult) {
+  backtestError.value = ''
+  backtestResult.value = row
+}
+
+function clearBacktestResult() {
+  backtestError.value = ''
+  backtestResult.value = null
+}
+
+const backtestHistoryRowProps = (row: BacktestResult) => ({
+  style: 'cursor: pointer',
+  onClick: () => loadBacktestResult(row),
+})
+
 async function confirmClose() {
   const row = closeTarget.value
   if (!row) return
@@ -1105,9 +1472,11 @@ async function refreshAll() {
     botStatus.refresh(),
     botJournal.refresh(),
     botLedger.refresh(),
+    backtestHistory.refresh(),
   ])
   hydrateStrategyForm()
   hydrateBotRules()
+  if (!backtestSynced.value) syncBacktestFromBot(false)
 }
 
 async function triggerScan() {
@@ -1164,6 +1533,49 @@ async function saveAll(showSuccess = true): Promise<boolean> {
 
 async function handleSave() {
   await saveAll(true)
+}
+
+async function runBotBacktest() {
+  backtestRunning.value = true
+  backtestError.value = ''
+  backtestResult.value = null
+  try {
+    const result = await post<BacktestResult>('/paper-bot/backtest', {
+      jsonl_file: null,
+      history_bases: backtestHistoryBasesPayload(),
+      history_base_limit: Math.max(1, Math.floor(backtestForm.historyBaseLimit || 80)),
+      history_venues: backtestForm.historyVenues.length > 0 ? backtestForm.historyVenues.join(',') : null,
+      history_days: backtestForm.historyDays,
+      capital: backtestForm.capital,
+      trade_usd: backtestForm.tradeUsd,
+      min_spread: backtestForm.minSpread,
+      exit_edge: backtestForm.exitEdge,
+      max_positions: backtestForm.maxPositions,
+      min_edge_pct: backtestForm.minEdge,
+      min_edge_1h: backtestForm.minEdge1h || null,
+      min_edge_mismatch: backtestForm.allowMismatch ? backtestForm.minEdgeMismatch || null : null,
+      max_mark_spread_pct: backtestForm.maxMarkSpread,
+      max_holding_hours: backtestForm.maxHoldingHours,
+      allow_mismatch: backtestForm.allowMismatch,
+      consecutive_hits: backtestForm.consecutiveHits,
+      min_settle_minutes: backtestForm.minSettleMinutes,
+      max_settle_minutes: backtestForm.maxSettleMinutes,
+      max_actions_per_run: backtestForm.maxActionsPerRun,
+      basis_cost_pct: backtestForm.basisCostPct,
+      active_exit_enabled: backtestForm.activeExitEnabled,
+      active_exit_confirm_minutes: backtestForm.activeExitConfirmMinutes,
+      active_exit_window_minutes: backtestForm.activeExitWindowMinutes,
+      active_exit_max_mark_spread_pct: backtestForm.activeExitMaxMarkSpreadPct,
+    })
+    backtestResult.value = result
+    message.success(t('backtest.backtestComplete'))
+    await backtestHistory.refresh()
+  } catch (e) {
+    backtestError.value = e instanceof Error ? e.message : t('backtest.backtestFailed')
+    message.error(backtestError.value)
+  } finally {
+    backtestRunning.value = false
+  }
 }
 
 async function handleRunOnce() {
@@ -1257,6 +1669,20 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="paper-bot-page">
+    <n-card size="small" class="mode-card">
+      <div class="mode-bar">
+        <div class="section-title">
+          <n-icon size="20"><PieChartOutline /></n-icon>
+          <span>{{ t('paperBot.title') }}</span>
+        </div>
+        <n-radio-group v-model:value="pageMode" size="small">
+          <n-radio-button value="trade">{{ t('paperBot.tradeMode') }}</n-radio-button>
+          <n-radio-button value="backtest">{{ t('paperBot.backtestMode') }}</n-radio-button>
+        </n-radio-group>
+      </div>
+    </n-card>
+
+    <template v-if="pageMode === 'trade'">
     <n-grid :cols="5" :x-gap="16" :y-gap="16" responsive="screen" class="summary-grid">
       <n-gi v-for="card in summaryCards" :key="card.label">
         <n-card size="small" class="summary-shell">
@@ -1414,12 +1840,38 @@ onBeforeUnmount(() => {
             </n-form-item>
           </n-gi>
           <n-gi>
+            <n-form-item :label="t('paperBot.activeExit')">
+              <n-switch v-model:value="botRules.activeExitEnabled" />
+            </n-form-item>
+          </n-gi>
+          <n-gi>
             <n-form-item :label="t('paperBot.settleWindow')">
               <div class="range-row">
                 <n-input-number v-model:value="botRules.minSettleMinutes" :min="0" :show-button="false" />
                 <span>-</span>
                 <n-input-number v-model:value="botRules.maxSettleMinutes" :min="1" :show-button="false" />
               </div>
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item :label="t('paperBot.activeExitConfirm')">
+              <n-input-number v-model:value="botRules.activeExitConfirmMinutes" :min="0" :step="1" style="width:100%">
+                <template #suffix>m</template>
+              </n-input-number>
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item :label="t('paperBot.activeExitWindow')">
+              <n-input-number v-model:value="botRules.activeExitWindowMinutes" :min="1" :step="5" style="width:100%">
+                <template #suffix>m</template>
+              </n-input-number>
+            </n-form-item>
+          </n-gi>
+          <n-gi>
+            <n-form-item :label="t('paperBot.activeExitMarkSpread')">
+              <n-input-number v-model:value="botRules.activeExitMaxMarkSpreadPct" :min="0" :max="100" :step="0.01" style="width:100%">
+                <template #suffix>%</template>
+              </n-input-number>
             </n-form-item>
           </n-gi>
           <n-gi :span="2">
@@ -1599,6 +2051,313 @@ onBeforeUnmount(() => {
         <n-empty v-else :description="t('paperBot.noJournal')" style="padding: 30px 0" />
       </n-spin>
     </n-card>
+    </template>
+
+    <template v-else>
+      <n-card size="small" class="backtest-card">
+        <template #header>
+          <div class="section-title">
+            <n-icon size="20"><StatsChartOutline /></n-icon>
+            <span>{{ t('paperBot.backtestTitle') }}</span>
+            <n-tag size="small" type="warning" :bordered="false">{{ t('paperBot.dryRunOnly') }}</n-tag>
+          </div>
+        </template>
+        <template #header-extra>
+          <n-space align="center">
+            <n-button size="small" secondary @click="syncBacktestFromBot(true)">
+              {{ t('paperBot.syncBacktestParams') }}
+            </n-button>
+            <n-button type="primary" size="small" :loading="backtestRunning" @click="runBotBacktest">
+              <template #icon><n-icon><PlayCircleOutline /></n-icon></template>
+              {{ t('backtest.runBacktest') }}
+            </n-button>
+          </n-space>
+        </template>
+
+        <n-form label-placement="top" size="small" class="strategy-form">
+          <n-grid :cols="6" :x-gap="12" :y-gap="8" responsive="screen">
+            <n-gi :span="2">
+              <n-form-item :label="t('backtest.historicalBases')">
+                <n-input
+                  v-model:value="backtestForm.historyBases"
+                  :placeholder="t('backtest.historicalBasesPlaceholder')"
+                  style="width:100%"
+                />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.historyBaseLimit')">
+                <n-input-number v-model:value="backtestForm.historyBaseLimit" :min="1" :max="200" :step="10" style="width:100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.historyDays')">
+                <n-input-number v-model:value="backtestForm.historyDays" :min="1" :max="365" style="width:100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi :span="2">
+              <n-form-item :label="t('backtest.venues')">
+                <n-select
+                  v-model:value="backtestForm.historyVenues"
+                  :options="scanVenueOptions"
+                  multiple
+                  filterable
+                  max-tag-count="responsive"
+                  style="width:100%"
+                />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.initialCapital')">
+                <n-input-number v-model:value="backtestForm.capital" :min="1000" :step="1000" style="width:100%">
+                  <template #suffix>USDT</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.tradeSize')">
+                <n-input-number v-model:value="backtestForm.tradeUsd" :min="100" :step="1000" style="width:100%">
+                  <template #suffix>USDT</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.maxPositions')">
+                <n-input-number v-model:value="backtestForm.maxPositions" :min="1" :max="20" style="width:100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.minSpread')">
+                <n-input-number v-model:value="backtestForm.minSpread" :min="0" :max="100" :step="0.01" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('settings.minEdgeAnnual')">
+                <n-input-number v-model:value="backtestForm.minEdge" :min="0" :max="100" :step="0.005" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('settings.minEdge1h')">
+                <n-input-number v-model:value="backtestForm.minEdge1h" :min="0" :max="100" :step="0.005" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('settings.minEdgeMismatch')">
+                <n-input-number v-model:value="backtestForm.minEdgeMismatch" :min="0" :max="100" :step="0.005" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('backtest.exitEdge')">
+                <n-input-number v-model:value="backtestForm.exitEdge" :min="0" :max="100" :step="0.005" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('settings.maxMarkSpread')">
+                <n-input-number v-model:value="backtestForm.maxMarkSpread" :min="0" :max="100" :step="0.01" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.maxHold')">
+                <n-input-number v-model:value="backtestForm.maxHoldingHours" :min="1" :max="2160" :step="1" style="width:100%">
+                  <template #suffix>h</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.consecutiveHits')">
+                <n-input-number v-model:value="backtestForm.consecutiveHits" :min="1" :max="20" :step="1" style="width:100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.maxActions')">
+                <n-input-number v-model:value="backtestForm.maxActionsPerRun" :min="1" :max="50" :step="1" style="width:100%" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.activeExit')">
+                <n-switch v-model:value="backtestForm.activeExitEnabled" />
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.settleWindow')">
+                <div class="range-row">
+                  <n-input-number v-model:value="backtestForm.minSettleMinutes" :min="0" :show-button="false" />
+                  <span>-</span>
+                  <n-input-number v-model:value="backtestForm.maxSettleMinutes" :min="1" :show-button="false" />
+                </div>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.activeExitConfirm')">
+                <n-input-number v-model:value="backtestForm.activeExitConfirmMinutes" :min="0" :step="1" style="width:100%">
+                  <template #suffix>m</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.activeExitWindow')">
+                <n-input-number v-model:value="backtestForm.activeExitWindowMinutes" :min="1" :step="5" style="width:100%">
+                  <template #suffix>m</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.activeExitMarkSpread')">
+                <n-input-number v-model:value="backtestForm.activeExitMaxMarkSpreadPct" :min="0" :max="100" :step="0.01" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.basisCost')">
+                <n-input-number v-model:value="backtestForm.basisCostPct" :min="0" :max="5" :step="0.01" style="width:100%">
+                  <template #suffix>%</template>
+                </n-input-number>
+              </n-form-item>
+            </n-gi>
+            <n-gi>
+              <n-form-item :label="t('paperBot.crossInterval')">
+                <n-switch v-model:value="backtestForm.allowMismatch" />
+              </n-form-item>
+            </n-gi>
+          </n-grid>
+        </n-form>
+      </n-card>
+
+      <n-alert
+        v-if="backtestError"
+        type="error"
+        :title="t('backtest.backtestFailed')"
+        class="backtest-result-card"
+      >
+        <div>{{ backtestError }}</div>
+        <n-text depth="3">{{ t('paperBot.backtestFailureHint') }}</n-text>
+      </n-alert>
+
+      <n-alert
+        v-if="selectedBacktestIsLegacy"
+        type="warning"
+        :title="t('paperBot.legacyBacktestTitle')"
+        class="backtest-result-card"
+      >
+        {{ t('paperBot.legacyBacktestNotice') }}
+      </n-alert>
+
+      <n-grid v-if="hasBacktestResult" :cols="3" :x-gap="16" :y-gap="16" responsive="screen" class="summary-grid">
+        <n-gi v-for="card in backtestSummaryCards" :key="card.label">
+          <n-card size="small" class="summary-shell">
+            <div class="summary-card">
+              <div class="summary-icon" :style="{ backgroundColor: card.color + '22', color: card.color }">
+                <n-icon size="22"><component :is="card.icon" /></n-icon>
+              </div>
+              <div class="summary-copy">
+                <n-text depth="3" class="summary-label">{{ card.label }}</n-text>
+                <n-text strong class="summary-value">{{ card.value }}</n-text>
+              </div>
+            </div>
+          </n-card>
+        </n-gi>
+      </n-grid>
+
+      <n-card v-if="hasBacktestResult && backtestChartOption" :title="t('backtest.equityCurve')" size="small" class="backtest-result-card">
+        <template #header-extra>
+          <n-space>
+            <n-button size="small" secondary @click="clearBacktestResult">
+              {{ t('backtest.backToHistory') }}
+            </n-button>
+            <n-button size="small" secondary @click="backtestHistory.refresh">
+              <template #icon><n-icon><RefreshOutline /></n-icon></template>
+              {{ t('backtest.refreshHistory') }}
+            </n-button>
+          </n-space>
+        </template>
+        <v-chart :option="backtestChartOption" autoresize class="backtest-chart" />
+      </n-card>
+
+      <n-card v-if="hasBacktestResult && isPaperBotBacktestResult" :title="t('paperBot.dailyScanLog')" size="small" class="backtest-result-card">
+        <n-data-table
+          v-if="backtestDailyRows.length > 0"
+          :columns="backtestDailyColumns"
+          :data="backtestDailyRows"
+          :bordered="false"
+          :row-key="(row: BacktestDailyLog) => row.date"
+          :scroll-x="1100"
+          :max-height="320"
+          size="small"
+          striped
+        />
+        <n-empty v-else :description="t('paperBot.noBacktestScanLog')" style="padding: 20px 0" />
+      </n-card>
+
+      <n-card v-if="hasBacktestResult && isPaperBotBacktestResult" :title="t('paperBot.scanHistory')" size="small" class="backtest-result-card">
+        <n-data-table
+          v-if="backtestScanRows.length > 0"
+          :columns="backtestScanColumns"
+          :data="backtestScanRows"
+          :bordered="false"
+          :row-key="(row: BacktestScanRow) => row.id"
+          :scroll-x="900"
+          :max-height="300"
+          size="small"
+          striped
+        />
+        <n-empty v-else :description="t('paperBot.noBacktestScanLog')" style="padding: 20px 0" />
+      </n-card>
+
+      <n-card v-if="hasBacktestResult" :title="t('backtest.tradeDetails')" size="small" class="backtest-result-card">
+        <n-data-table
+          v-if="backtestResult!.trades.length > 0"
+          :columns="backtestTradeColumns"
+          :data="backtestResult!.trades"
+          :bordered="false"
+          :scroll-x="1020"
+          :max-height="400"
+          virtual
+          size="small"
+          striped
+        />
+        <n-empty v-else :description="t('backtest.noTrades')" style="padding: 20px 0" />
+      </n-card>
+
+      <n-card v-if="!hasBacktestResult && backtestHistory.data.value?.length === 0" size="small" class="backtest-result-card">
+        <n-empty :description="t('backtest.placeholder')" style="padding: 60px 0" />
+      </n-card>
+
+      <n-card
+        v-if="!hasBacktestResult && backtestHistory.data.value && backtestHistory.data.value.length > 0"
+        :title="t('backtest.historyTitle')"
+        size="small"
+        class="backtest-result-card"
+      >
+        <template #header-extra>
+          <n-button size="small" secondary @click="backtestHistory.refresh">
+            <template #icon><n-icon><RefreshOutline /></n-icon></template>
+            {{ t('backtest.refreshHistory') }}
+          </n-button>
+        </template>
+        <n-data-table
+          :row-props="backtestHistoryRowProps"
+          :columns="backtestHistoryColumns"
+          :data="backtestHistory.data.value"
+          :bordered="false"
+          :scroll-x="890"
+          size="small"
+          striped
+        />
+      </n-card>
+    </template>
 
     <n-modal v-model:show="showCloseModal" preset="card" :title="t('positions.confirmClose')" style="width: 420px">
       <n-text v-if="closeTarget">
@@ -1626,17 +2385,28 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
+.mode-card,
 .summary-grid {
   flex-shrink: 0;
 }
 
+.mode-card,
 .summary-shell,
 .strategy-card,
 .table-card,
 .positions-card,
 .ledger-card,
-.journal-card {
+.journal-card,
+.backtest-card,
+.backtest-result-card {
   border-radius: 8px;
+}
+
+.mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .summary-card {
@@ -1741,13 +2511,25 @@ onBeforeUnmount(() => {
 .table-card,
 .positions-card,
 .ledger-card,
-.journal-card {
+.journal-card,
+.backtest-card,
+.backtest-result-card {
   min-height: 0;
+}
+
+.backtest-chart {
+  height: 260px;
+  width: 100%;
 }
 
 @media (max-width: 900px) {
   .paper-bot-page {
     height: auto;
+  }
+
+  .mode-bar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .bot-status-strip {
