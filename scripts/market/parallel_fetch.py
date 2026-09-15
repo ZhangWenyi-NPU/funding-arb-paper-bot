@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Any, Callable, TypeVar
 
 K = TypeVar("K")
@@ -42,29 +42,36 @@ def run_io_parallel(
                 return {}
             raise
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {pool.submit(fn, key): key for key in keys}
-        for fut in as_completed(futures, timeout=timeout):
-            key = futures[fut]
-            try:
-                k, v = fut.result()
-                out[k] = v
-            except Exception as e:
-                if swallow_errors:
-                    if on_error:
-                        on_error(key, e)
-                    continue
-                raise
-        # Cancel any futures that didn't complete within the timeout window
-        if timeout is not None:
-            for fut, key in futures.items():
-                if not fut.done():
-                    fut.cancel()
+        try:
+            done_iter = as_completed(futures, timeout=timeout)
+            for fut in done_iter:
+                key = futures[fut]
+                try:
+                    k, v = fut.result()
+                    out[k] = v
+                except Exception as e:
                     if swallow_errors:
                         if on_error:
-                            on_error(key, TimeoutError(f"timed out after {timeout}s"))
-                    # If not swallow_errors, we still don't raise here —
-                    # as_completed already raised TimeoutError above.
+                            on_error(key, e)
+                        continue
+                    raise
+        except FuturesTimeoutError as e:
+            if not swallow_errors:
+                raise
+            if on_error:
+                unfinished = [key for fut, key in futures.items() if not fut.done()]
+                for key in unfinished:
+                    on_error(key, TimeoutError(f"timed out after {timeout}s"))
+
+        if timeout is not None:
+            for fut in futures:
+                if not fut.done():
+                    fut.cancel()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return out
 
 

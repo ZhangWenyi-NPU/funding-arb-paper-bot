@@ -22,9 +22,12 @@ if (isDemoMode) {
 
 export interface ScannerStatus {
   scanning: boolean;
+  scan_started_at?: string | null;
+  scan_age_sec?: number;
   last_scan_time: string | null;
   has_data: boolean;
   live: boolean;
+  last_error?: string | null;
 }
 
 export interface OpportunityItem {

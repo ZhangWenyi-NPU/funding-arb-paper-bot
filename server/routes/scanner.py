@@ -61,6 +61,10 @@ _unified_results: list[dict[str, Any]] = []
 _unified_ts: float = 0.0
 # Per-strategy locks so a slow carry/unified scan never blocks pure (and vice versa)
 _scanning_strategies: set[str] = set()
+_scan_started_at: dict[str, float] = {}
+_scan_errors: dict[str, str] = {}
+PURE_SCAN_TIMEOUT_SEC = 75.0
+DEGRADED_KEEP_RATIO = 0.6
 
 # ---------------------------------------------------------------------------
 # Strategy config helpers (thresholds + venues from Settings)
@@ -103,6 +107,27 @@ def _venue_sets_match(requested: list[str], cached: list[str] | None) -> bool:
     if not cached:
         return False
     return set(requested) == set(cached)
+
+
+def _pure_result_quality(result: dict[str, Any] | None) -> int:
+    if not result:
+        return 0
+    try:
+        return int(result.get("total_assets_scanned", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_degraded_pure_result(new: dict[str, Any], old: dict[str, Any] | None) -> bool:
+    if not old:
+        return False
+    if not _venue_sets_match(new.get("venues") or [], old.get("venues") or []):
+        return False
+    old_quality = _pure_result_quality(old)
+    new_quality = _pure_result_quality(new)
+    if old_quality < 100:
+        return False
+    return new_quality < old_quality * DEGRADED_KEEP_RATIO
 
 
 def _scan_thresholds() -> tuple[float, float, float]:
@@ -427,9 +452,20 @@ async def scanner_status(
         "success": True,
         "data": {
             "scanning": scanning,
+            "scan_started_at": (
+                datetime.fromtimestamp(_scan_started_at[strategy], tz=timezone.utc).isoformat()
+                if strategy in _scan_started_at
+                else None
+            ),
+            "scan_age_sec": (
+                round(time.time() - _scan_started_at[strategy], 1)
+                if strategy in _scan_started_at
+                else 0
+            ),
             "last_scan_time": ts,
             "has_data": has_data,
             "live": live,
+            "last_error": _scan_errors.get(strategy),
         },
     }
 
@@ -530,6 +566,7 @@ async def scanner_trigger(
         return {"success": False, "error": "Scan already in progress"}
 
     _scanning_strategies.add(strategy)
+    _scan_started_at[strategy] = time.time()
     try:
         loop = asyncio.get_running_loop()
 
@@ -563,9 +600,24 @@ async def scanner_trigger(
                 )
                 return _apply_group_thresholds(raw, min_edge, edge_1h, edge_mismatch)
 
-            result = await loop.run_in_executor(None, _run_pure)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _run_pure),
+                timeout=PURE_SCAN_TIMEOUT_SEC,
+            )
+            if _is_degraded_pure_result(result, _pure_results):
+                _scan_errors[strategy] = (
+                    "New pure scan looked degraded; kept previous healthier cache"
+                )
+                return {
+                    "success": True,
+                    "data": _pure_results,
+                    "live": True,
+                    "degraded": True,
+                    "warning": _scan_errors[strategy],
+                }
             _pure_results = result
             _pure_ts = time.time()
+            _scan_errors.pop(strategy, None)
             await _broadcast("scanner.update", result)
             return {"success": True, "data": result, "live": True}
 
@@ -613,9 +665,13 @@ async def scanner_trigger(
                 with ThreadPoolExecutor(max_workers=len(carry_venues)) as pool:
                     return list(pool.map(_scan_one_carry, carry_venues))
 
-            result = await loop.run_in_executor(None, _scan_all_carry)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _scan_all_carry),
+                timeout=PURE_SCAN_TIMEOUT_SEC,
+            )
             _carry_results = result
             _carry_ts = time.time()
+            _scan_errors.pop(strategy, None)
             await _broadcast("scanner.update", {"strategy": "carry", "data": result})
             return {"success": True, "data": result, "live": True}
 
@@ -663,16 +719,25 @@ async def scanner_trigger(
                 result.sort(key=lambda x: -(x["net_edge_pct"] or 0))
                 return result[:100]
 
-            result = await loop.run_in_executor(None, _scan_unified)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _scan_unified),
+                timeout=PURE_SCAN_TIMEOUT_SEC,
+            )
             _unified_results = result
             _unified_ts = time.time()
+            _scan_errors.pop(strategy, None)
             await _broadcast("scanner.update", {"strategy": "unified", "data": result})
             return {"success": True, "data": result, "live": True}
 
+    except asyncio.TimeoutError:
+        _scan_errors[strategy] = f"Scan timed out after {PURE_SCAN_TIMEOUT_SEC:.0f}s"
+        return {"success": False, "error": _scan_errors[strategy]}
     except Exception as e:
-        return {"success": False, "error": f"Scan failed: {e}"}
+        _scan_errors[strategy] = f"Scan failed: {e}"
+        return {"success": False, "error": _scan_errors[strategy]}
     finally:
         _scanning_strategies.discard(strategy)
+        _scan_started_at.pop(strategy, None)
 
 
 @router.post("/scanner/scan-all")
@@ -702,6 +767,42 @@ async def scanner_scan_all():
         results["unified"] = None
 
     return {"success": True, "data": results}
+
+
+@router.post("/scanner/reset")
+async def scanner_reset(
+    strategy: str | None = Query(
+        None, description="Optional strategy to reset: pure, carry, or unified"
+    ),
+    clear_cache: bool = Query(False, description="Also clear cached scan results"),
+):
+    """Clear stuck scanner state without restarting the server."""
+    global _pure_results, _pure_ts, _carry_results, _carry_ts, _unified_results, _unified_ts
+
+    strategies = [strategy] if strategy in {"pure", "carry", "unified"} else ["pure", "carry", "unified"]
+    for item in strategies:
+        _scanning_strategies.discard(item)
+        _scan_started_at.pop(item, None)
+        _scan_errors.pop(item, None)
+
+    if clear_cache:
+        if "pure" in strategies:
+            _pure_results = None
+            _pure_ts = 0.0
+        if "carry" in strategies:
+            _carry_results = []
+            _carry_ts = 0.0
+        if "unified" in strategies:
+            _unified_results = []
+            _unified_ts = 0.0
+
+    return {
+        "success": True,
+        "data": {
+            "reset": strategies,
+            "clear_cache": clear_cache,
+        },
+    }
 
 
 @router.post("/scanner/recalc-fees")

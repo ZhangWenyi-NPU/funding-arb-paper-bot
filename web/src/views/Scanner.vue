@@ -112,10 +112,14 @@
 
               <div class="filter-group actions-inline">
                 <n-tag v-if="refreshing" size="small" type="info" :bordered="false" class="status-tag">{{ t('scanner.scanningFromExchanges') }}</n-tag>
+                <n-tag v-else-if="scannerLastError" size="small" type="warning" :bordered="false" class="status-tag">{{ scannerLastError }}</n-tag>
                 <n-tag v-else-if="lastScanLabel" size="small" type="success" :bordered="false" class="status-tag">{{ lastScanLabel }}</n-tag>
                 <n-button size="small" type="primary" ghost @click="handleTriggerScan" :loading="refreshing" class="action-btn">
                   <template #icon><n-icon size="14"><SearchOutline /></n-icon></template>
                   {{ t('scanner.scanNow') }}
+                </n-button>
+                <n-button size="small" secondary @click="handleResetScanner" :loading="resettingScanner" class="action-btn">
+                  {{ t('scanner.resetScanner') }}
                 </n-button>
               </div>
             </div>
@@ -336,7 +340,9 @@ function loadSavedStrategy(): Strategy {
 const strategy = ref<Strategy>(loadSavedStrategy())
 const loading = ref(false)
 const refreshing = ref(false)
+const resettingScanner = ref(false)
 const lastScanLabel = ref('')
+const scannerLastError = ref('')
 
 // Data stores per strategy
 const pureData = ref<ScannerOpportunities | null>(null)
@@ -611,8 +617,16 @@ async function refreshScanLabel(st: Strategy) {
     const resp = await fetch(`/api/scanner/status?strategy=${st}`)
     const json = await resp.json()
     lastScanLabel.value = formatScanTime(json.data?.last_scan_time)
+    const err = json.data?.last_error
+    const age = Number(json.data?.scan_age_sec || 0)
+    scannerLastError.value = err
+      ? String(err)
+      : json.data?.scanning && age > 60
+        ? t('scanner.scanStuck', { seconds: Math.round(age) })
+        : ''
   } catch {
     lastScanLabel.value = ''
+    scannerLastError.value = ''
   }
 }
 
@@ -767,6 +781,21 @@ async function handleTriggerScan() {
     message.error(e instanceof Error ? e.message : t('scanner.scanFailed'))
   }
   finally { refreshing.value = false }
+}
+
+async function handleResetScanner() {
+  if (isDemoMode) return
+  resettingScanner.value = true
+  try {
+    await post('/scanner/reset', {})
+    scannerLastError.value = ''
+    message.success(t('scanner.scannerReset'))
+    await handleTriggerScan()
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : t('scanner.scanFailed'))
+  } finally {
+    resettingScanner.value = false
+  }
 }
 
 function onStrategyChange(val: Strategy) {

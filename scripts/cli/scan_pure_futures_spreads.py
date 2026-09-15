@@ -71,6 +71,8 @@ from core.fee_providers import (
 # Unified cross-scan cache for fetch_all_fee_rate_rows_by_base.
 # Keyed by venue, holds (timestamp, by_base_dict). Populated when cache_ttl_sec > 0.
 _FETCH_ALL_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+_FETCH_ALL_ERRORS: dict[str, str] = {}
+STALE_FALLBACK_SEC = 15 * 60
 
 # USDT-stablecoin / wrapped-asset blacklist (no point arbing against CEX's internal USD)
 SYMBOL_BLACKLIST = {"USDC", "FDUSD", "TUSD", "BTCDOM", "BUSD", "USDP", "DAI"}
@@ -174,17 +176,51 @@ def fetch_all_fee_rate_rows_by_base(
             }
         return venue, by_base
 
+    errors: dict[str, str] = {}
+
+    def _record_error(venue: str, exc: Exception) -> None:
+        errors[str(venue)] = str(exc)
+
     fetched = run_io_parallel(
-        venues, _fetch_one, max_workers=workers, swallow_errors=True, timeout=30.0
+        venues,
+        _fetch_one,
+        max_workers=workers,
+        swallow_errors=True,
+        on_error=_record_error,
+        timeout=30.0,
     )
+    now = time.time()
+    _FETCH_ALL_ERRORS.update(errors)
     for venue, by_base in fetched.items():
+        _FETCH_ALL_ERRORS.pop(venue, None)
         # Store in cache
         if cache_ttl_sec > 0:
-            _FETCH_ALL_CACHE[venue] = (time.time(), by_base)
+            _FETCH_ALL_CACHE[venue] = (now, by_base)
         for base, info in by_base.items():
             if base not in out:
                 out[base] = {}
             out[base][venue] = info
+
+    # If a venue times out or fails, keep a recent stale snapshot instead of
+    # making the whole venue disappear from this scan. This is deliberately
+    # bounded so stale data cannot live forever.
+    if cache_ttl_sec > 0:
+        for venue in venues:
+            if venue in fetched:
+                continue
+            entry = _FETCH_ALL_CACHE.get(venue)
+            if not entry:
+                continue
+            ts, by_base = entry
+            if now - ts > STALE_FALLBACK_SEC:
+                continue
+            for base, info in by_base.items():
+                if base not in out:
+                    out[base] = {}
+                row = dict(info)
+                row["stale"] = True
+                row["stale_age_sec"] = round(now - ts, 1)
+                out[base][venue] = row
     return out
 
 
@@ -505,6 +541,14 @@ def scan_pure_futures_spreads(
         venues = ["binance", "bitget", "bybit", "okx"]
 
     by_base = fetch_all_fee_rate_rows_by_base(venues, workers, cache_ttl_sec=30.0)
+    stale_venues = sorted(
+        {
+            venue
+            for per_venue in by_base.values()
+            for venue, info in per_venue.items()
+            if isinstance(info, dict) and info.get("stale")
+        }
+    )
     _backfill_missing_settle_times(by_base, venues, workers)
     policy = parse_fee_policy(fee_policy)
     fee_cache = build_policy_futures_cache(by_base, policy, workers=workers)
@@ -539,6 +583,8 @@ def scan_pure_futures_spreads(
             [{"pair": k, "count": v} for k, v in venue_pairs.items()],
             key=lambda x: -x["count"],
         ),
+        "stale_venues": stale_venues,
+        "venue_errors": dict(_FETCH_ALL_ERRORS),
         "timestamp": datetime.now(TZ_UTC).isoformat(),
     }
 
